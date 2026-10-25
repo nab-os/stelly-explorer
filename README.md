@@ -13,8 +13,9 @@ Native, drawn by the GPU through egui and wgpu: the whole catalogue
 | | |
 |---|---|
 | **Projections** | **Map**, the server's UMAP of the whole catalogue · **PCA** in 2D or 3D · **Axes**, any two or three columns of the space, raw or spread evenly by rank · **UMAP** in 2D or 3D, run here on a sample |
-| **Colour** | **Genre**, the eight biggest in checked colourblind-safe hues, the rest grey · **Key** on the Camelot wheel · **Tempo** · any **column**, on a diverging scale |
-| **Focus** | Click a genre or a key in the legend to light only those tracks; a key lights the keys it mixes with too. Search by title, artist or album. |
+| **Colour** | **Genre**, the eight biggest in checked colourblind-safe hues, the rest grey · **Key** on the Camelot wheel · **Tempo** · any **column**, on a diverging scale · **Mix**: ready to mix, analysed but drifting, or not analysed by [stelly-mix](https://github.com/nab-os/stelly-mix) |
+| **Focus** | Click a genre, a key or a mix state in the legend to light only those tracks; a key lights the keys it mixes with too. Search by title, artist or album. |
+| **For mixing** | For the picked track, stelly-mix's whole-track tempo and key beside the excerpt's, and whether its beat holds · its best mixes, with tempo change, key steps and where each mix happens, drawn as arrows · a set planned from it on the server, drawn as a numbered route · or, not analysed yet, its place in the queue and a button to analyse it now |
 | **Names** | Each genre named where it gathers, in 2D and in 3D, as the Stelly app's map does |
 | **A track** | Hover for its name, tempo and key; click for its details, its mood, and its nearest tracks in the space, drawn as lines on the map |
 | **Weights** | How much each part of the space counts, for PCA, UMAP and the nearest tracks; the server's defaults to start |

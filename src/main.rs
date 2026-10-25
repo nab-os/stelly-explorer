@@ -6,6 +6,7 @@ mod app;
 mod camera;
 mod colour;
 mod labels;
+mod mix;
 mod project;
 mod render;
 mod source;

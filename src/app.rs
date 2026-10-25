@@ -8,15 +8,18 @@
 use crate::camera::Camera;
 use crate::colour::{self, Colouring, Legend, Rgba};
 use crate::labels::{self, Region};
+use crate::mix::{self, Plan, Readiness, Summary, Way};
 use crate::project::{self, Progress, Projection};
 use crate::render::{Draw, Instance, Points, Renderer};
 use crate::source::{self, Origin, Server};
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 use eframe::egui_wgpu;
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::{Receiver, channel};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::Arc;
 use std::time::Instant;
+use stelly_core::api::MixState;
 use stelly_core::vectors::{Vectors, unquantise};
 
 const BACKGROUND: Color32 = Color32::from_rgb(0x12, 0x13, 0x1a);
@@ -30,6 +33,8 @@ const REACH: f32 = 9.0;
 /// The most names on screen at once.
 const LABELS: usize = 40;
 const NEIGHBOURS: usize = 15;
+/// Ways out of the picked track asked of the server.
+const WAYS: usize = 12;
 
 struct Data {
     v: Arc<Vectors>,
@@ -37,6 +42,8 @@ struct Data {
     unit: Arc<Vec<f32>>,
     /// Title, artist and album, lowercased once, for the search.
     haystacks: Vec<String>,
+    /// Track id to row.
+    row_of: HashMap<i64, usize>,
 }
 
 impl Data {
@@ -44,7 +51,8 @@ impl Data {
         let weights: Vec<f32> = v.head.blocks.iter().map(|b| b.default_weight).collect();
         let unit = Arc::new(project::weighted(&v, &weights));
         let haystacks = (0..v.head.n).map(|i| format!("{}\n{}\n{}", v.titles[i], v.artists[i], v.albums[i]).to_lowercase()).collect();
-        Self { v: Arc::new(v), weights, unit, haystacks }
+        let row_of = v.ids.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+        Self { v: Arc::new(v), weights, unit, haystacks, row_of }
     }
 }
 
@@ -55,12 +63,23 @@ struct Job {
     started: Instant,
 }
 
+/// What a call to the server's mix library came back with. Each is for the
+/// track it names, and dropped if that is no longer the one picked.
+enum MixReply {
+    Library(anyhow::Result<HashMap<i64, Summary>>),
+    State(i64, anyhow::Result<MixState>),
+    Ways(i64, anyhow::Result<Vec<Way>>),
+    Analysed(i64, anyhow::Result<()>),
+    Planned(i64, anyhow::Result<Plan>),
+}
+
 /// What a click on a legend narrows the view to.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Focus {
     Genre(u16),
     /// A Camelot place, and the keys that mix with it.
     Key(u8, bool),
+    Mix(Readiness),
 }
 
 /// The projection panel's own choices, applied on change (or, for UMAP,
@@ -119,6 +138,25 @@ pub struct Explorer {
     neighbours: Vec<(usize, f32)>,
     frame_times: Vec<f32>,
     last_frame: Instant,
+
+    mix_tx: Sender<MixReply>,
+    mix_rx: Receiver<MixReply>,
+    /// stelly-mix's library on the server, by track id, once read.
+    mix: Option<HashMap<i64, Summary>>,
+    mix_failure: Option<String>,
+    /// Each row's readiness; empty until the mix library comes.
+    readiness: Vec<Readiness>,
+    /// The track the picked one's mix data was asked for.
+    asked_for: Option<i64>,
+    mix_state: Option<MixState>,
+    ways: Option<anyhow::Result<Vec<Way>>>,
+    analysing: Option<i64>,
+    analyse_failure: Option<String>,
+    set_minutes: f64,
+    /// When the plan being waited for was asked.
+    planning: Option<Instant>,
+    set: Option<anyhow::Result<Plan>>,
+    show_ways: bool,
 }
 
 impl Explorer {
@@ -134,6 +172,7 @@ impl Explorer {
         cc.egui_ctx.set_visuals(visuals);
 
         let server = Server::find();
+        let (mix_tx, mix_rx) = channel();
         let mut app = Self {
             form: server.clone().unwrap_or_default(),
             server,
@@ -173,6 +212,20 @@ impl Explorer {
             neighbours: Vec::new(),
             frame_times: Vec::new(),
             last_frame: Instant::now(),
+            mix_tx,
+            mix_rx,
+            mix: None,
+            mix_failure: None,
+            readiness: Vec::new(),
+            asked_for: None,
+            mix_state: None,
+            ways: None,
+            analysing: None,
+            analyse_failure: None,
+            set_minutes: 30.0,
+            planning: None,
+            set: None,
+            show_ways: true,
         };
         app.load(&cc.egui_ctx);
         app
@@ -207,9 +260,96 @@ impl Explorer {
                 self.recolour();
                 self.reproject(ctx, self.projection.clone());
                 self.find_neighbours();
+                self.update_readiness();
+                self.ask(ctx, |s| MixReply::Library(mix::library(s)));
             }
             Err(err) => self.failure = Some(format!("{err:#}")),
         }
+    }
+
+    /// One call to the server's mix library, on a thread of its own.
+    fn ask(&self, ctx: &egui::Context, call: impl FnOnce(&Server) -> MixReply + Send + 'static) {
+        let Some(server) = self.server.clone() else { return };
+        let (tx, ctx) = (self.mix_tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(call(&server));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Whatever the mix library has answered since the last frame.
+    fn mix_replies(&mut self, ctx: &egui::Context) {
+        while let Ok(reply) = self.mix_rx.try_recv() {
+            let picked = self.picked_id();
+            match reply {
+                MixReply::Library(Ok(library)) => {
+                    self.mix = Some(library);
+                    self.mix_failure = None;
+                    self.update_readiness();
+                    // The picked track may have just become analysed.
+                    self.asked_for = None;
+                }
+                MixReply::Library(Err(err)) => self.mix_failure = Some(format!("{err:#}")),
+                MixReply::State(id, state) if Some(id) == picked => self.mix_state = state.ok(),
+                MixReply::Ways(id, ways) if Some(id) == picked => self.ways = Some(ways),
+                MixReply::Analysed(id, result) => {
+                    self.analysing = None;
+                    match result {
+                        Ok(()) => {
+                            self.analyse_failure = None;
+                            self.ask(ctx, |s| MixReply::Library(mix::library(s)));
+                        }
+                        Err(err) if Some(id) == picked => self.analyse_failure = Some(format!("{err:#}")),
+                        Err(_) => {}
+                    }
+                }
+                MixReply::Planned(id, plan) if Some(id) == picked => {
+                    self.planning = None;
+                    self.set = Some(plan);
+                }
+                MixReply::Planned(..) => self.planning = None,
+                _ => {}
+            }
+        }
+        // The picked track's state and ways, asked for once per pick.
+        if picked_changed(self.picked_id(), &mut self.asked_for) {
+            self.mix_state = None;
+            self.ways = None;
+            self.analyse_failure = None;
+            if let Some(id) = self.asked_for {
+                if self.summary_of(id).is_some() {
+                    self.ask(ctx, move |s| MixReply::Ways(id, mix::next(s, id, WAYS)));
+                } else if self.mix.is_some() {
+                    self.ask(ctx, move |s| MixReply::State(id, mix::state(s, id)));
+                }
+            }
+        }
+    }
+
+    fn picked_id(&self) -> Option<i64> {
+        Some(self.data.as_ref()?.v.ids[self.selected?])
+    }
+
+    fn summary_of(&self, id: i64) -> Option<&Summary> {
+        self.mix.as_ref()?.get(&id)
+    }
+
+    fn update_readiness(&mut self) {
+        let (Some(data), Some(library)) = (&self.data, &self.mix) else { return };
+        self.readiness = data
+            .v
+            .ids
+            .iter()
+            .map(|id| match library.get(id) {
+                Some(s) if s.steady => Readiness::Ready,
+                Some(_) => Readiness::Drifting,
+                None => Readiness::NotAnalysed,
+            })
+            .collect();
+        if self.colouring == Colouring::Mix {
+            self.recolour();
+        }
+        self.dirty = true;
     }
 
     fn reproject(&mut self, ctx: &egui::Context, projection: Projection) {
@@ -250,7 +390,7 @@ impl Explorer {
 
     fn recolour(&mut self) {
         let Some(data) = &self.data else { return };
-        (self.colours, self.legend) = colour::colour(&data.v, self.colouring);
+        (self.colours, self.legend) = colour::colour(&data.v, self.colouring, &self.readiness);
         self.dirty = true;
     }
 
@@ -268,6 +408,7 @@ impl Explorer {
                 let a = letter == 'A';
                 (n == number && a != minor) || (a == minor && (n == number || (n % 12) + 1 == number || (number % 12) + 1 == n))
             }
+            Some(Focus::Mix(r)) => self.readiness.get(i).copied().unwrap_or(Readiness::NotAnalysed) == r,
         }
     }
 
@@ -330,6 +471,9 @@ impl Explorer {
         if self.selected != i {
             self.selected = i;
             self.find_neighbours();
+            // A set belongs to the track it was planned from.
+            self.set = None;
+            self.planning = None;
         }
     }
 
@@ -352,6 +496,7 @@ impl eframe::App for Explorer {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.arrived(&ctx);
+        self.mix_replies(&ctx);
         self.projected();
         let now = Instant::now();
         self.frame_times.push((now - self.last_frame).as_secs_f32());
@@ -359,7 +504,7 @@ impl eframe::App for Explorer {
         if self.frame_times.len() > 60 {
             self.frame_times.remove(0);
         }
-        if self.job.is_some() || self.loading.is_some() {
+        if self.job.is_some() || self.loading.is_some() || self.analysing.is_some() || self.planning.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
@@ -433,6 +578,18 @@ impl Explorer {
         let n = v.head.n;
         let on_map = v.xy.iter().filter(|p| p[0].is_finite()).count();
         ui.label(RichText::new(format!("{n} tracks, {on_map} on the map, {} genres", v.head.genres.len())).color(MUTED));
+        match (&self.mix, &self.mix_failure) {
+            (Some(library), _) => {
+                let ready = self.readiness.iter().filter(|r| **r == Readiness::Ready).count();
+                ui.label(RichText::new(format!("{} analysed for mixing, {ready} ready", library.len())).color(MUTED));
+            }
+            (None, Some(failure)) => {
+                ui.label(RichText::new(format!("No mix data: {failure}")).color(MUTED).small());
+            }
+            (None, None) => {
+                ui.label(RichText::new("Reading the mix library…").color(MUTED).small());
+            }
+        }
         ui.horizontal(|ui| {
             if let Some(server) = &self.server {
                 ui.label(RichText::new(server.base.trim_start_matches("https://").trim_start_matches("http://")).color(MUTED).small());
@@ -503,6 +660,7 @@ impl Explorer {
             ui.selectable_value(&mut self.colouring, Colouring::Genre, "Genre");
             ui.selectable_value(&mut self.colouring, Colouring::Key, "Key");
             ui.selectable_value(&mut self.colouring, Colouring::Tempo, "Tempo");
+            ui.selectable_value(&mut self.colouring, Colouring::Mix, "Mix").on_hover_text("Which tracks stelly-mix has analysed whole, and which a set can use");
             let column = if let Colouring::Column(c) = self.colouring { Some(c) } else { None };
             if ui.selectable_label(column.is_some(), "Column").clicked() && column.is_none() {
                 let mood = v.head.blocks.iter().find(|b| b.name == "mood").map_or(0, |b| b.start);
@@ -554,6 +712,7 @@ impl Explorer {
         }
         ui.checkbox(&mut self.show_labels, "Genre names");
         ui.checkbox(&mut self.show_links, "Lines to the picked track's nearest");
+        ui.checkbox(&mut self.show_ways, "Arrows to its best mixes");
         if ui.button("Fit the view").clicked() {
             self.camera = Camera::default();
         }
@@ -646,6 +805,30 @@ impl Explorer {
                 };
                 ui.label(RichText::new(text).color(MUTED).small());
             }
+            Legend::Mix(rows) => {
+                for (name, rgba, count, readiness) in rows {
+                    let on = focus == Some(Focus::Mix(*readiness));
+                    let response = ui
+                        .horizontal(|ui| {
+                            swatch(ui, *rgba);
+                            let r = ui.selectable_label(on, RichText::new(name).color(TEXT));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.label(RichText::new(count.to_string()).color(MUTED).small());
+                            });
+                            r
+                        })
+                        .inner;
+                    if response.clicked() {
+                        focus = if on { None } else { Some(Focus::Mix(*readiness)) };
+                    }
+                }
+                let text = if self.mix.is_some() {
+                    "Ready: analysed whole, on one tempo throughout, so a set can use it. A drifting tempo keeps a track out of planned sets."
+                } else {
+                    "The mix library has not come yet: every track shows as not analysed."
+                };
+                ui.label(RichText::new(text).color(MUTED).small());
+            }
             Legend::Ramp { stops, low, middle, high } => {
                 let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 14.0), Sense::hover());
                 let w = rect.width() / stops.len() as f32;
@@ -702,6 +885,8 @@ impl Explorer {
                 self.camera.target = glam::Vec3::from(*p);
             }
 
+        self.for_mixing(ui, &v, i);
+
         if let Some(mood) = v.head.blocks.iter().find(|b| b.name == "mood") {
             ui.separator();
             section(ui, "Mood");
@@ -734,6 +919,155 @@ impl Explorer {
             if response.inner.clicked() {
                 pick = Some(j);
             }
+        }
+        if pick.is_some() {
+            self.select(pick);
+        }
+    }
+
+    /// The picked track as stelly-mix knows it: its whole-track tempo and
+    /// key, its best mixes, a set from it, or the way to have it analysed.
+    fn for_mixing(&mut self, ui: &mut egui::Ui, v: &Vectors, i: usize) {
+        let id = v.ids[i];
+        let ctx = ui.ctx().clone();
+        ui.separator();
+        section(ui, "For mixing");
+        if self.mix.is_none() {
+            let text = self.mix_failure.as_deref().map_or("Reading the mix library…".to_string(), |f| format!("No mix data: {f}"));
+            ui.label(RichText::new(text).color(MUTED).small());
+            return;
+        }
+        let Some(summary) = self.summary_of(id).cloned() else {
+            let state = match &self.mix_state {
+                Some(MixState::Queued { reason, ahead }) => format!("Queued for its analysis ({reason}), {ahead} ahead."),
+                Some(MixState::Analysing) => "Being analysed now.".to_string(),
+                Some(MixState::Failed { reason }) => format!("Its analysis failed: {reason}"),
+                Some(MixState::Analysed { .. }) => "Analysed; reload to see it.".to_string(),
+                Some(MixState::Unasked) | None => "Not analysed for mixing yet.".to_string(),
+            };
+            ui.label(RichText::new(state).color(TEXT));
+            if self.analysing == Some(id) {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(RichText::new("Downloading and analysing; minutes if the server is busy.").color(MUTED).small());
+                });
+            } else if ui.add_enabled(self.analysing.is_none(), egui::Button::new("Analyse for mixing now")).clicked() {
+                self.analysing = Some(id);
+                self.analyse_failure = None;
+                self.ask(&ctx, move |s| MixReply::Analysed(id, mix::analyse_now(s, id)));
+            }
+            if let Some(failure) = &self.analyse_failure {
+                ui.label(RichText::new(failure).color(Color32::from_rgb(0xf7, 0x76, 0x8e)).small());
+            }
+            return;
+        };
+
+        egui::Grid::new("mix-facts").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
+            let excerpt = if v.bpm[i].is_finite() { format!(" (excerpt {:.0})", v.bpm[i]) } else { String::new() };
+            let tempo = summary.bpm.map_or("none found".to_string(), |b| format!("{b:.1} BPM{excerpt}"));
+            let excerpt_key = v.key(i).map(|k| {
+                let (n, l) = k.camelot();
+                format!("{n}{l}")
+            });
+            let key = match (&summary.key, excerpt_key) {
+                (Some(whole), Some(part)) if *whole != part => format!("{whole} (excerpt {part})"),
+                (Some(whole), _) => whole.clone(),
+                (None, _) => "none found".into(),
+            };
+            let steady = if summary.steady { "steady: a set can use it" } else { "drifts: sets leave it out" };
+            let length = format!("{}:{:02}, {} phrases", summary.seconds as u32 / 60, summary.seconds as u32 % 60, summary.phrases);
+            for (k, value) in [("Tempo", tempo), ("Key", key), ("Beat", steady.to_string()), ("Length", length)] {
+                ui.label(RichText::new(k).color(MUTED));
+                ui.label(RichText::new(value).color(TEXT));
+                ui.end_row();
+            }
+        });
+
+        ui.add_space(6.0);
+        ui.label(RichText::new("Best mixes from here").color(TEXT).strong());
+        let mut pick = None;
+        match &self.ways {
+            None => {
+                ui.spinner();
+            }
+            Some(Err(err)) => {
+                ui.label(RichText::new(format!("{err:#}")).color(MUTED).small());
+            }
+            Some(Ok(ways)) if ways.is_empty() => {
+                ui.label(RichText::new("Nothing in the mix library mixes with it.").color(MUTED).small());
+            }
+            Some(Ok(ways)) => {
+                let rows = self.data.as_ref().map(|d| &d.row_of);
+                for way in ways {
+                    let Some(&j) = rows.and_then(|r| r.get(&way.to)) else { continue };
+                    let response = ui
+                        .vertical(|ui| {
+                            let r = ui.horizontal(|ui| {
+                                ui.label(RichText::new(format!("{:.2}", way.score)).color(MUTED).small().monospace());
+                                ui.selectable_label(false, RichText::new(format!("{} · {}", v.titles[j], v.artists[j])).color(TEXT))
+                            });
+                            ui.label(RichText::new(way_detail(way)).color(MUTED).small());
+                            r.inner
+                        })
+                        .inner;
+                    if response.clicked() {
+                        pick = Some(j);
+                    }
+                }
+            }
+        }
+
+        ui.add_space(6.0);
+        ui.label(RichText::new("A set from here").color(TEXT).strong());
+        ui.horizontal(|ui| {
+            ui.add(egui::Slider::new(&mut self.set_minutes, 10.0..=120.0).step_by(5.0).suffix(" min"));
+            if let Some(since) = self.planning {
+                ui.spinner();
+                ui.label(RichText::new(format!("{:.0} s", since.elapsed().as_secs_f32())).color(MUTED).small());
+            } else if ui.button("Plan").on_hover_text("stelly-mix's planner, on the server").clicked() {
+                self.planning = Some(Instant::now());
+                self.set = None;
+                let minutes = self.set_minutes;
+                self.ask(&ctx, move |s| MixReply::Planned(id, mix::plan(s, id, minutes)));
+            }
+            if self.set.is_some() && ui.small_button("Clear").clicked() {
+                self.set = None;
+            }
+        });
+        if self.planning.is_some() {
+            ui.label(RichText::new("The server plans it: about half a minute for twenty minutes of set, more for longer.").color(MUTED).small());
+        }
+        if !summary.steady {
+            ui.label(RichText::new("Its tempo drifts, so it may not open a set: the planner may refuse it.").color(MUTED).small());
+        }
+        match &self.set {
+            Some(Err(err)) => {
+                ui.label(RichText::new(format!("{err:#}")).color(MUTED).small());
+            }
+            Some(Ok(plan)) => {
+                ui.label(
+                    RichText::new(format!("{} tracks, {:.0} min, mean mix {:.2}; drawn on the map", plan.tracks.len(), plan.seconds / 60.0, plan.mean_score))
+                        .color(MUTED)
+                        .small(),
+                );
+                let rows = self.data.as_ref().map(|d| &d.row_of);
+                for (k, id) in plan.tracks.iter().enumerate() {
+                    let Some(&j) = rows.and_then(|r| r.get(id)) else { continue };
+                    let score = if k == 0 { "start".to_string() } else { format!("{:.2}", plan.ways[k - 1].score) };
+                    let response = ui.horizontal(|ui| {
+                        ui.label(RichText::new(format!("{:>2}", k + 1)).color(MUTED).small().monospace());
+                        ui.label(RichText::new(score).color(MUTED).small().monospace());
+                        ui.selectable_label(false, RichText::new(format!("{} · {}", v.titles[j], v.artists[j])).color(TEXT))
+                    });
+                    if response.inner.clicked() {
+                        // Looked at, not picked: picking would drop the set.
+                        if let Some(p) = self.positions.get(j).filter(|p| p[0].is_finite()) {
+                            self.camera.target = glam::Vec3::from(*p);
+                        }
+                    }
+                }
+            }
+            None => {}
         }
         if pick.is_some() {
             self.select(pick);
@@ -874,6 +1208,51 @@ impl Explorer {
             self.draw_labels(&painter, rect, &to_screen, &v);
         }
 
+        // A planned set: its route, numbered, under the picked track's marks.
+        if let Some(Ok(plan)) = &self.set {
+            let rows = self.data.as_ref().map(|d| &d.row_of);
+            let stops: Vec<Pos2> = plan
+                .tracks
+                .iter()
+                .filter_map(|id| rows.and_then(|r| r.get(id)))
+                .filter_map(|&j| self.positions.get(j).filter(|p| p[0].is_finite()).and_then(|p| to_screen(*p)))
+                .map(|(s, _)| s)
+                .collect();
+            let [r, g, b, _] = colour::DRIFTING;
+            let route = Color32::from_rgb(r, g, b);
+            for pair in stops.windows(2) {
+                painter.line_segment([pair[0], pair[1]], Stroke::new(2.0, route));
+            }
+            for (k, at) in stops.iter().enumerate() {
+                painter.circle_filled(*at, 8.0, BACKGROUND);
+                painter.circle_stroke(*at, 8.0, Stroke::new(1.5, route));
+                painter.text(*at, Align2::CENTER_CENTER, (k + 1).to_string(), FontId::proportional(10.0), TEXT);
+            }
+        }
+
+        // The best ways out of the picked track, as arrows.
+        if self.show_ways
+            && let (Some(i), Some(Ok(ways))) = (self.selected, &self.ways)
+            && let Some((s, _)) = self.positions.get(i).filter(|p| p[0].is_finite()).and_then(|p| to_screen(*p))
+        {
+            let rows = self.data.as_ref().map(|d| &d.row_of);
+            let [r, g, b, _] = colour::READY;
+            let arrow = Color32::from_rgb(r, g, b);
+            for way in ways {
+                let Some(&j) = rows.and_then(|r| r.get(&way.to)) else { continue };
+                let Some((t, _)) = self.positions.get(j).filter(|p| p[0].is_finite()).and_then(|p| to_screen(*p)) else { continue };
+                let length = (t - s).length();
+                if length < 1.0 {
+                    continue;
+                }
+                let direction = (t - s) / length;
+                let tip = t - direction * (self.radius + 4.0);
+                painter.line_segment([s, tip], Stroke::new(1.5, arrow.linear_multiply(0.8)));
+                let side = Vec2::new(-direction.y, direction.x) * 4.0;
+                painter.add(egui::Shape::convex_polygon(vec![tip, tip - direction * 8.0 + side, tip - direction * 8.0 - side], arrow, Stroke::NONE));
+            }
+        }
+
         if let Some(i) = self.selected
             && let Some((s, _)) = self.positions.get(i).filter(|p| p[0].is_finite()).and_then(|p| to_screen(*p)) {
                 if self.show_links {
@@ -897,7 +1276,12 @@ impl Explorer {
                     let (n, l) = k.camelot();
                     format!("{n}{l} {}", k.name())
                 });
-                let lines = [(v.titles[i].clone(), TEXT, true), (format!("{} · {genre}", v.artists[i]), MUTED, false), (format!("{tempo} · {key}"), MUTED, false)];
+                let mut lines = vec![(v.titles[i].clone(), TEXT, true), (format!("{} · {genre}", v.artists[i]), MUTED, false), (format!("{tempo} · {key}"), MUTED, false)];
+                if let Some(summary) = self.summary_of(v.ids[i]) {
+                    let bpm = summary.bpm.map_or(String::new(), |b| format!(" · {b:.1} BPM"));
+                    let state = if summary.steady { "ready to mix" } else { "analysed, tempo drifts" };
+                    lines.push((format!("{state}{bpm}"), MUTED, false));
+                }
                 tooltip(&painter, rect, s, &lines);
                 ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
             }
@@ -946,6 +1330,28 @@ impl Explorer {
             painter.galley(Pos2::new(chip.left() + 17.0, chip.top() + 3.0), galley, TEXT);
         }
     }
+}
+
+/// Whether the picked track is another than the one asked about, which then
+/// becomes it.
+fn picked_changed(picked: Option<i64>, asked_for: &mut Option<i64>) -> bool {
+    if picked == *asked_for {
+        return false;
+    }
+    *asked_for = picked;
+    true
+}
+
+/// A way's tempo, key and where it happens, as a line under its track.
+fn way_detail(way: &Way) -> String {
+    let clock = |s: f64| format!("{}:{:02}", s as u32 / 60, s as u32 % 60);
+    let keys = match way.key_steps {
+        Some(0) => " · same key".to_string(),
+        Some(1) => " · 1 key step".to_string(),
+        Some(n) => format!(" · {n} key steps"),
+        None => String::new(),
+    };
+    format!("{:+.1}% tempo{keys} · sound {:.2} · out at {} → in at {}", (way.ratio - 1.0) * 100.0, way.sound, clock(way.out_at.0), clock(way.into_at.0))
 }
 
 fn section(ui: &mut egui::Ui, title: &str) {

@@ -8,6 +8,7 @@
 //! for a signed value. The key wheel is the exception a wheel has to be, and
 //! the legend names every key so the colour is never alone.
 
+use crate::mix::Readiness;
 use stelly_core::vectors::{Key, Vectors, unquantise};
 
 pub type Rgba = [u8; 4];
@@ -18,6 +19,8 @@ pub enum Colouring {
     Key,
     Tempo,
     Column(usize),
+    /// Whether stelly-mix has analysed it whole, and whether a set can use it.
+    Mix,
 }
 
 pub enum Legend {
@@ -27,6 +30,8 @@ pub enum Legend {
     Ramp { stops: Vec<Rgba>, low: String, middle: String, high: String },
     /// The Camelot wheel: for each of 1 to 12, the major (B) and minor (A).
     Wheel { major: [Rgba; 12], minor: [Rgba; 12], unsure: usize },
+    /// Where tracks stand for mixing: (name, colour, tracks, which).
+    Mix(Vec<(String, Rgba, usize, Readiness)>),
 }
 
 /// The validated categorical slots, stepped for a dark surface.
@@ -53,13 +58,41 @@ const fn rgb(r: u8, g: u8, b: u8) -> Rgba {
     [r, g, b, 255]
 }
 
-pub fn colour(v: &Vectors, mode: Colouring) -> (Vec<Rgba>, Legend) {
+/// `readiness` is each track's, by row; empty while the mix library has not
+/// come, when every track is drawn as not analysed.
+pub fn colour(v: &Vectors, mode: Colouring, readiness: &[Readiness]) -> (Vec<Rgba>, Legend) {
     match mode {
         Colouring::Genre => genre(v),
         Colouring::Key => key(v),
         Colouring::Tempo => tempo(v),
         Colouring::Column(c) => column(v, c),
+        Colouring::Mix => mix(v, readiness),
     }
+}
+
+/// Ready in the green slot, drifting in the amber one, the rest grey: a
+/// state, so the legend names each and the colour is never alone.
+pub const READY: Rgba = CATEGORICAL[2];
+pub const DRIFTING: Rgba = CATEGORICAL[3];
+
+fn mix(v: &Vectors, readiness: &[Readiness]) -> (Vec<Rgba>, Legend) {
+    let of = |i: usize| readiness.get(i).copied().unwrap_or(Readiness::NotAnalysed);
+    let colour = |r: Readiness| match r {
+        Readiness::Ready => READY,
+        Readiness::Drifting => DRIFTING,
+        Readiness::NotAnalysed => MUTED,
+    };
+    let colours = (0..v.head.n).map(|i| colour(of(i))).collect();
+    let count = |r: Readiness| (0..v.head.n).filter(|&i| of(i) == r).count();
+    let legend = [
+        ("Ready to mix", Readiness::Ready),
+        ("Analysed, tempo drifts", Readiness::Drifting),
+        ("Not analysed for mixing", Readiness::NotAnalysed),
+    ]
+    .into_iter()
+    .map(|(name, r)| (name.to_string(), colour(r), count(r), r))
+    .collect();
+    (colours, Legend::Mix(legend))
 }
 
 fn genre(v: &Vectors) -> (Vec<Rgba>, Legend) {
