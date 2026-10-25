@@ -7,6 +7,7 @@ mod camera;
 mod colour;
 mod labels;
 mod mix;
+mod phrase_paths;
 mod project;
 mod render;
 mod source;

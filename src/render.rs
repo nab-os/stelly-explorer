@@ -27,13 +27,28 @@ pub struct Points {
     pub instances: Vec<Instance>,
 }
 
+/// One straight piece of a curve: 28 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct Line {
+    pub from: [f32; 3],
+    pub to: [f32; 3],
+    pub colour: [u8; 4],
+}
+
+/// The lines drawn under the points, as `Points` is.
+pub struct Lines {
+    pub version: u64,
+    pub lines: Vec<Line>,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Uniforms {
     view_proj: [[f32; 4]; 4],
     viewport: [f32; 2],
     radius: f32,
-    _pad: f32,
+    line_width: f32,
 }
 
 pub const DEPTH: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
@@ -43,9 +58,45 @@ struct Uniforms {
     view_proj: mat4x4<f32>,
     viewport: vec2<f32>,
     radius: f32,
-    _pad: f32,
+    line_width: f32,
 };
 @group(0) @binding(0) var<uniform> u: Uniforms;
+
+struct LineOut {
+    @builtin(position) position: vec4<f32>,
+    @location(0) colour: vec4<f32>,
+    @location(1) across: f32,
+};
+
+// A line piece as a quad, as wide on screen as `line_width` pixels plus one
+// for its soft edge, whatever its depth.
+@vertex
+fn line_vs(@builtin(vertex_index) vertex: u32, @location(0) head: vec3<f32>, @location(1) tail: vec3<f32>, @location(2) colour: vec4<f32>) -> LineOut {
+    var ends = array<f32, 6>(0.0, 1.0, 1.0, 0.0, 1.0, 0.0);
+    var sides = array<f32, 6>(-1.0, -1.0, 1.0, -1.0, 1.0, 1.0);
+    let a = u.view_proj * vec4(head, 1.0);
+    let b = u.view_proj * vec4(tail, 1.0);
+    let pa = a.xy / a.w * u.viewport;
+    let pb = b.xy / b.w * u.viewport;
+    var along = pb - pa;
+    if (length(along) < 1e-6) {
+        along = vec2(1.0, 0.0);
+    }
+    let normal = normalize(vec2(-along.y, along.x));
+    let reach = (u.line_width + 1.0) * 0.5;
+    let end = select(a, b, ends[vertex] > 0.5);
+    var out: LineOut;
+    out.position = vec4(end.xy + normal * sides[vertex] * reach * 2.0 / u.viewport * end.w, end.zw);
+    out.colour = colour;
+    out.across = sides[vertex] * reach;
+    return out;
+}
+
+@fragment
+fn line_fs(in: LineOut) -> @location(0) vec4<f32> {
+    let coverage = clamp(u.line_width * 0.5 + 0.5 - abs(in.across), 0.0, 1.0);
+    return vec4(in.colour.rgb, in.colour.a * coverage);
+}
 
 struct Out {
     @builtin(position) position: vec4<f32>,
@@ -97,6 +148,11 @@ fn fs(in: Out) -> Fragment {
 /// Lives in egui's callback resources: made once, kept for the app's life.
 pub struct Renderer {
     pipeline: wgpu::RenderPipeline,
+    line_pipeline: wgpu::RenderPipeline,
+    lines: wgpu::Buffer,
+    line_capacity: usize,
+    line_count: u32,
+    line_version: u64,
     bind_group: wgpu::BindGroup,
     uniforms: wgpu::Buffer,
     instances: wgpu::Buffer,
@@ -169,6 +225,43 @@ impl Renderer {
             multiview_mask: None,
             cache: None,
         });
+        // The lines: no depth written, so the points drawn after them stay
+        // on top, but tested, so in 3D a near cloud hides a far path.
+        let line_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("lines"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("line_vs"),
+                compilation_options: Default::default(),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<Line>() as u64,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Unorm8x4],
+                })],
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("line_fs"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
         let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("points uniforms"),
             size: std::mem::size_of::<Uniforms>() as u64,
@@ -181,7 +274,30 @@ impl Renderer {
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: uniforms.as_entire_binding() }],
         });
         let instances = Self::buffer(device, 1);
-        Renderer { pipeline, bind_group, uniforms, instances, capacity: 1, count: 0, version: u64::MAX }
+        let lines = Self::line_buffer(device, 1);
+        Renderer {
+            pipeline,
+            line_pipeline,
+            lines,
+            line_capacity: 1,
+            line_count: 0,
+            line_version: u64::MAX,
+            bind_group,
+            uniforms,
+            instances,
+            capacity: 1,
+            count: 0,
+            version: u64::MAX,
+        }
+    }
+
+    fn line_buffer(device: &wgpu::Device, capacity: usize) -> wgpu::Buffer {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("lines"),
+            size: (capacity * std::mem::size_of::<Line>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
     }
 
     fn buffer(device: &wgpu::Device, capacity: usize) -> wgpu::Buffer {
@@ -197,6 +313,9 @@ impl Renderer {
 /// One frame's draw: the points as they stand and where the camera is.
 pub struct Draw {
     pub points: Arc<Points>,
+    pub lines: Arc<Lines>,
+    /// Physical pixels.
+    pub line_width: f32,
     pub view_proj: glam::Mat4,
     /// Radius in physical pixels.
     pub radius: f32,
@@ -225,12 +344,22 @@ impl egui_wgpu::CallbackTrait for Draw {
             r.count = self.points.instances.len() as u32;
             r.version = self.points.version;
         }
+        if r.line_version != self.lines.version {
+            let needed = self.lines.lines.len().max(1);
+            if needed > r.line_capacity {
+                r.line_capacity = needed + needed / 4;
+                r.lines = Renderer::line_buffer(device, r.line_capacity);
+            }
+            queue.write_buffer(&r.lines, 0, bytemuck::cast_slice(&self.lines.lines));
+            r.line_count = self.lines.lines.len() as u32;
+            r.line_version = self.lines.version;
+        }
         let _ = screen;
         let uniforms = Uniforms {
             view_proj: self.view_proj.to_cols_array_2d(),
             viewport: [self.viewport[0].max(1.0), self.viewport[1].max(1.0)],
             radius: self.radius,
-            _pad: 0.0,
+            line_width: self.line_width,
         };
         queue.write_buffer(&r.uniforms, 0, bytemuck::bytes_of(&uniforms));
         Vec::new()
@@ -238,11 +367,16 @@ impl egui_wgpu::CallbackTrait for Draw {
 
     fn paint(&self, _info: egui::PaintCallbackInfo, pass: &mut wgpu::RenderPass<'static>, resources: &egui_wgpu::CallbackResources) {
         let Some(r) = resources.get::<Renderer>() else { return };
+        pass.set_bind_group(0, &r.bind_group, &[]);
+        if r.line_count > 0 {
+            pass.set_pipeline(&r.line_pipeline);
+            pass.set_vertex_buffer(0, r.lines.slice(..(r.line_count as u64 * std::mem::size_of::<Line>() as u64)));
+            pass.draw(0..6, 0..r.line_count);
+        }
         if r.count == 0 {
             return;
         }
         pass.set_pipeline(&r.pipeline);
-        pass.set_bind_group(0, &r.bind_group, &[]);
         pass.set_vertex_buffer(0, r.instances.slice(..(r.count as u64 * std::mem::size_of::<Instance>() as u64)));
         pass.draw(0..6, 0..r.count);
     }
@@ -302,6 +436,9 @@ mod tests {
                     Instance { position: [0.8, 0.8, 0.0], colour: [0, 255, 0, 255] },
                 ],
             }),
+            // And a line, away from the points.
+            lines: Arc::new(Lines { version: 1, lines: vec![Line { from: [-0.6, -0.6, 0.0], to: [-0.6, 0.3, 0.0], colour: [255, 255, 255, 255] }] }),
+            line_width: 3.0,
             view_proj: camera.view_proj(true, 1.0),
             radius: 4.0,
             viewport: [SIZE as f32; 2],
@@ -363,6 +500,8 @@ mod tests {
         assert!(centre[0] > 200 && centre[1] < 60 && centre[2] < 60, "the near red point should cover the blue and the dimmed: {centre:?}");
         let corner = pixel([0.8, 0.8, 0.0]);
         assert!(corner[1] > 200 && corner[0] < 60, "a green point where the camera puts it: {corner:?}");
+        let along = pixel([-0.6, -0.15, 0.0]);
+        assert!(along.iter().all(|c| *c > 200), "the line, drawn where the camera puts it: {along:?}");
         assert_eq!(&bytes[0..3], &[0, 0, 0], "nothing drawn elsewhere");
     }
 }

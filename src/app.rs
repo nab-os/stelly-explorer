@@ -9,8 +9,9 @@ use crate::camera::Camera;
 use crate::colour::{self, Colouring, Legend, Rgba};
 use crate::labels::{self, Region};
 use crate::mix::{self, Plan, Readiness, Summary, Way};
+use crate::phrase_paths::{self, Placement};
 use crate::project::{self, Progress, Projection};
-use crate::render::{Draw, Instance, Points, Renderer};
+use crate::render::{Draw, Instance, Lines, Points, Renderer};
 use crate::source::{self, Origin, Server};
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 use eframe::egui_wgpu;
@@ -20,6 +21,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::Arc;
 use std::time::Instant;
 use stelly_core::api::MixState;
+use stelly_core::phrases::Phrases;
 use stelly_core::vectors::{Vectors, unquantise};
 
 const BACKGROUND: Color32 = Color32::from_rgb(0x12, 0x13, 0x1a);
@@ -157,6 +159,19 @@ pub struct Explorer {
     planning: Option<Instant>,
     set: Option<anyhow::Result<Plan>>,
     show_ways: bool,
+
+    /// The global switch: every mix-analysed track drawn as its phrases' path.
+    show_paths: bool,
+    path_width: f32,
+    phrases: Option<Arc<Phrases>>,
+    phrases_loading: Option<Receiver<anyhow::Result<(Phrases, Origin)>>>,
+    paths_failure: Option<String>,
+    placing: Option<(Progress, Receiver<Option<Placement>>)>,
+    placement: Option<Arc<Placement>>,
+    /// Row to its index in `placement.tracks`.
+    path_of: HashMap<usize, usize>,
+    phrase_positions: Vec<[f32; 3]>,
+    lines: Arc<Lines>,
 }
 
 impl Explorer {
@@ -226,6 +241,16 @@ impl Explorer {
             planning: None,
             set: None,
             show_ways: true,
+            show_paths: false,
+            path_width: 1.2,
+            phrases: None,
+            phrases_loading: None,
+            paths_failure: None,
+            placing: None,
+            placement: None,
+            path_of: HashMap::new(),
+            phrase_positions: Vec::new(),
+            lines: Arc::new(Lines { version: 0, lines: Vec::new() }),
         };
         app.load(&cc.egui_ctx);
         app
@@ -326,6 +351,79 @@ impl Explorer {
         }
     }
 
+    /// The phrase paths, turned on: what is not there yet is asked for.
+    fn paths_on(&mut self, ctx: &egui::Context) {
+        if self.phrases.is_none() && self.phrases_loading.is_none() {
+            let Some(server) = self.server.clone() else { return };
+            let (tx, rx) = channel();
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(source::phrases(&server));
+                ctx.request_repaint();
+            });
+            self.phrases_loading = Some(rx);
+            self.paths_failure = None;
+        } else if self.placement.is_none() && self.placing.is_none() {
+            self.place(ctx);
+        }
+        self.dirty = true;
+    }
+
+    /// Where each phrase sits among the tracks, on a thread: seconds over a
+    /// whole library. Again whenever the weights change.
+    fn place(&mut self, ctx: &egui::Context) {
+        let (Some(data), Some(phrases)) = (&self.data, &self.phrases) else { return };
+        if let Some((progress, _)) = self.placing.take() {
+            progress.cancelled.store(true, Ordering::Relaxed);
+        }
+        let progress = Progress::default();
+        let (tx, rx) = channel();
+        let (v, unit, weights, phrases, row_of, pr, ctx) =
+            (data.v.clone(), data.unit.clone(), data.weights.clone(), phrases.clone(), data.row_of.clone(), progress.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(phrase_paths::place(&v, &unit, &weights, &phrases, &row_of, &pr));
+            ctx.request_repaint();
+        });
+        self.placing = Some((progress, rx));
+    }
+
+    fn paths_arrived(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = &self.phrases_loading
+            && let Ok(result) = rx.try_recv()
+        {
+            self.phrases_loading = None;
+            match result {
+                Ok((phrases, _)) => {
+                    self.phrases = Some(Arc::new(phrases));
+                    if self.show_paths {
+                        self.place(ctx);
+                    }
+                }
+                Err(err) => self.paths_failure = Some(format!("{err:#}")),
+            }
+        }
+        if let Some((_, rx)) = &self.placing
+            && let Ok(result) = rx.try_recv()
+        {
+            self.placing = None;
+            if let Some(placement) = result {
+                self.path_of = placement.tracks.iter().enumerate().map(|(k, (row, _))| (*row, k)).collect();
+                self.placement = Some(Arc::new(placement));
+                self.place_phrases();
+            }
+        }
+    }
+
+    /// The phrases' places in the projection shown: where their nearest
+    /// tracks are, so nothing to work out again but a weighted mean.
+    fn place_phrases(&mut self) {
+        self.phrase_positions = match &self.placement {
+            Some(placement) if !self.positions.is_empty() => placement.positions(&self.positions),
+            _ => Vec::new(),
+        };
+        self.dirty = true;
+    }
+
     fn picked_id(&self) -> Option<i64> {
         Some(self.data.as_ref()?.v.ids[self.selected?])
     }
@@ -385,6 +483,7 @@ impl Explorer {
             self.camera = Camera::default();
         }
         self.projection = job.projection;
+        self.place_phrases();
         self.dirty = true;
     }
 
@@ -443,6 +542,22 @@ impl Explorer {
         self.drawn = dim.into_iter().chain(lit).collect();
         self.points = Arc::new(Points { version: self.points.version + 1, instances });
         self.screen_for = None;
+
+        // The paths of the lit tracks, faint, in their tracks' colours.
+        let lines = match &self.placement {
+            Some(placement) if self.show_paths && !self.phrase_positions.is_empty() => {
+                let alpha = if filtering { 150 } else { 70 };
+                placement.lines(&self.phrase_positions, |row| {
+                    self.lit(row).then(|| {
+                        let mut c = self.colours.get(row).copied().unwrap_or(colour::MUTED);
+                        c[3] = alpha;
+                        c
+                    })
+                })
+            }
+            _ => Vec::new(),
+        };
+        self.lines = Arc::new(Lines { version: self.lines.version + 1, lines });
     }
 
     fn find_neighbours(&mut self) {
@@ -497,6 +612,7 @@ impl eframe::App for Explorer {
         let ctx = ui.ctx().clone();
         self.arrived(&ctx);
         self.mix_replies(&ctx);
+        self.paths_arrived(&ctx);
         self.projected();
         let now = Instant::now();
         self.frame_times.push((now - self.last_frame).as_secs_f32());
@@ -504,7 +620,7 @@ impl eframe::App for Explorer {
         if self.frame_times.len() > 60 {
             self.frame_times.remove(0);
         }
-        if self.job.is_some() || self.loading.is_some() || self.analysing.is_some() || self.planning.is_some() {
+        if self.job.is_some() || self.loading.is_some() || self.analysing.is_some() || self.planning.is_some() || self.phrases_loading.is_some() || self.placing.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
@@ -713,6 +829,34 @@ impl Explorer {
         ui.checkbox(&mut self.show_labels, "Genre names");
         ui.checkbox(&mut self.show_links, "Lines to the picked track's nearest");
         ui.checkbox(&mut self.show_ways, "Arrows to its best mixes");
+        let before = self.show_paths;
+        ui.checkbox(&mut self.show_paths, "Phrase paths (P)")
+            .on_hover_text("Every track stelly-mix has analysed, drawn as the path its eight-bar phrases take through the space");
+        if self.show_paths != before {
+            if self.show_paths {
+                self.paths_on(ctx);
+            }
+            self.dirty = true;
+        }
+        if self.show_paths {
+            if self.phrases_loading.is_some() {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(RichText::new("Reading the phrases…").color(MUTED).small());
+                });
+            }
+            if let Some((progress, _)) = &self.placing {
+                let done = progress.done.load(Ordering::Relaxed) as f32 / 1000.0;
+                ui.add(egui::ProgressBar::new(done).desired_width(200.0).text("placing the phrases"));
+            }
+            if let Some(failure) = &self.paths_failure {
+                ui.label(RichText::new(format!("No phrases: {failure}")).color(MUTED).small());
+            }
+            if let Some(phrases) = &self.phrases {
+                ui.label(RichText::new(format!("{} tracks, {} phrases", phrases.head.tracks, phrases.head.phrases)).color(MUTED).small());
+            }
+            ui.add(egui::Slider::new(&mut self.path_width, 0.5..=4.0).text("path width"));
+        }
         if ui.button("Fit the view").clicked() {
             self.camera = Camera::default();
         }
@@ -738,6 +882,12 @@ impl Explorer {
                 data.unit = Arc::new(project::weighted(&data.v, &data.weights));
             }
             self.find_neighbours();
+            // Where a phrase sits among the tracks depends on the weights.
+            self.placement = None;
+            self.phrase_positions.clear();
+            if self.show_paths {
+                self.place(ctx);
+            }
             if matches!(self.projection, Projection::Pca { .. } | Projection::Umap { .. }) {
                 let p = self.projection.clone();
                 self.reproject(ctx, p);
@@ -886,6 +1036,11 @@ impl Explorer {
             }
 
         self.for_mixing(ui, &v, i);
+        if let (Some(placement), Some(&k)) = (&self.placement, self.path_of.get(&i)) {
+            let phrases = placement.tracks[k].1.len();
+            let shown = if self.show_paths { "drawn on the map, start to end" } else { "turn on phrase paths (P) to see them" };
+            ui.label(RichText::new(format!("{phrases} phrases, {shown}.")).color(MUTED).small());
+        }
 
         if let Some(mood) = v.head.blocks.iter().find(|b| b.name == "mood") {
             ui.separator();
@@ -1134,12 +1289,21 @@ impl Explorer {
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.select(None);
         }
+        if ctx.input(|i| i.key_pressed(egui::Key::P)) && !ctx.egui_wants_keyboard_input() {
+            self.show_paths = !self.show_paths;
+            if self.show_paths {
+                self.paths_on(&ctx);
+            }
+            self.dirty = true;
+        }
 
         // --------------------------------------------------- the points
         let view_proj = self.camera.view_proj(three, aspect);
         let ppp = ctx.pixels_per_point();
         let draw = Draw {
             points: self.points.clone(),
+            lines: self.lines.clone(),
+            line_width: self.path_width * ppp,
             view_proj,
             radius: self.radius * ppp,
             viewport: [rect.width() * ppp, rect.height() * ppp],
@@ -1227,6 +1391,36 @@ impl Explorer {
                 painter.circle_filled(*at, 8.0, BACKGROUND);
                 painter.circle_stroke(*at, 8.0, Stroke::new(1.5, route));
                 painter.text(*at, Align2::CENTER_CENTER, (k + 1).to_string(), FontId::proportional(10.0), TEXT);
+            }
+        }
+
+        // The picked track's own path, drawn out: its phrases, where it
+        // starts and where it ends.
+        if self.show_paths
+            && let (Some(i), Some(placement)) = (self.selected, &self.placement)
+            && let Some(&k) = self.path_of.get(&i)
+        {
+            let range = placement.tracks[k].1.clone();
+            let at: Vec<(Pos2, f32)> = range
+                .clone()
+                .filter_map(|ph| {
+                    let p = self.phrase_positions.get(ph).filter(|p| p[0].is_finite())?;
+                    Some((to_screen(*p)?.0, placement.starts[ph]))
+                })
+                .collect();
+            let curve: Vec<Pos2> = phrase_paths::smooth(&at.iter().map(|(p, _)| [p.x, p.y, 0.0]).collect::<Vec<_>>(), 6)
+                .into_iter()
+                .map(|q| Pos2::new(q[0], q[1]))
+                .collect();
+            painter.add(egui::Shape::line(curve.clone(), Stroke::new(4.0, BACKGROUND)));
+            painter.add(egui::Shape::line(curve, Stroke::new(2.0, TEXT)));
+            let clock = |s: f32| format!("{}:{:02}", s as u32 / 60, s as u32 % 60);
+            for (n, (q, start)) in at.iter().enumerate() {
+                painter.circle_filled(*q, 3.0, TEXT);
+                if n == 0 || n + 1 == at.len() {
+                    let label = if n == 0 { format!("starts {}", clock(*start)) } else { format!("last phrase {}", clock(*start)) };
+                    painter.text(*q + Vec2::new(8.0, -8.0), Align2::LEFT_BOTTOM, label, FontId::proportional(11.0), TEXT);
+                }
             }
         }
 

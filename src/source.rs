@@ -9,6 +9,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::Duration;
+use stelly_core::phrases::Phrases;
 use stelly_core::vectors::Vectors;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -51,27 +52,38 @@ pub enum Origin {
 
 /// The space, fresh if the server can be reached, else the last copy.
 pub fn load(server: &Server) -> Result<(Vectors, Origin)> {
+    cached(server, "/api/space/vectors", "vectors", Vectors::decode)
+}
+
+/// Each mix-analysed track's phrases, as `load` gets the space.
+pub fn phrases(server: &Server) -> Result<(Phrases, Origin)> {
+    cached(server, "/api/mix/phrases", "phrases", Phrases::decode)
+}
+
+/// A body the server stamps with an ETag, kept on disk as `name`: asked for
+/// only if it changed, and the copy on disk when the server cannot be asked.
+fn cached<T>(server: &Server, path: &str, name: &str, decode: fn(&[u8]) -> Result<T>) -> Result<(T, Origin)> {
     let cache = cache_dir();
-    let body_path = cache.join("vectors.bin");
-    let tag_path = cache.join("vectors.etag");
+    let body_path = cache.join(format!("{name}.bin"));
+    let tag_path = cache.join(format!("{name}.etag"));
     let held = std::fs::read(&body_path).ok();
     let tag = held.as_ref().and_then(|_| std::fs::read_to_string(&tag_path).ok());
 
-    match fetch(server, tag.as_deref()) {
+    match fetch(server, path, tag.as_deref()) {
         Ok(Fetched::Body { bytes, tag, wire }) => {
-            let vectors = Vectors::decode(&bytes).context("reading what the server sent")?;
+            let decoded = decode(&bytes).context("reading what the server sent")?;
             // A failed write costs the next start a download, nothing more.
             let _ = std::fs::create_dir_all(&cache)
                 .and_then(|_| std::fs::write(&body_path, &bytes))
                 .and_then(|_| std::fs::write(&tag_path, tag.unwrap_or_default()));
-            Ok((vectors, Origin::Server { bytes: wire }))
+            Ok((decoded, Origin::Server { bytes: wire }))
         }
         Ok(Fetched::Unchanged) => {
             let bytes = held.context("the server says the copy is current, but there is none")?;
-            Ok((Vectors::decode(&bytes)?, Origin::Unchanged))
+            Ok((decode(&bytes)?, Origin::Unchanged))
         }
         Err(err) => match held {
-            Some(bytes) => Ok((Vectors::decode(&bytes)?, Origin::Offline { reason: format!("{err:#}") })),
+            Some(bytes) => Ok((decode(&bytes)?, Origin::Offline { reason: format!("{err:#}") })),
             None => Err(err),
         },
     }
@@ -82,13 +94,13 @@ enum Fetched {
     Unchanged,
 }
 
-fn fetch(server: &Server, tag: Option<&str>) -> Result<Fetched> {
+fn fetch(server: &Server, path: &str, tag: Option<&str>) -> Result<Fetched> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(180)))
         .http_status_as_error(false)
         .build()
         .into();
-    let url = format!("{}/api/space/vectors", server.base.trim_end_matches('/'));
+    let url = format!("{}{path}", server.base.trim_end_matches('/'));
     let mut request = agent
         .get(&url)
         .header("Authorization", &format!("Bearer {}", server.token))
@@ -101,7 +113,7 @@ fn fetch(server: &Server, tag: Option<&str>) -> Result<Fetched> {
         304 => return Ok(Fetched::Unchanged),
         200 => {}
         401 | 403 => bail!("the server refused the token: pair this device again"),
-        404 => bail!("this server has no /api/space/vectors yet: it needs Stelly with stelly-explorer support"),
+        404 => bail!("this server has no {path} yet: it needs a newer Stelly"),
         503 => bail!("the server has no space built yet"),
         status => bail!("the server answered {status}"),
     }
@@ -115,9 +127,9 @@ fn fetch(server: &Server, tag: Option<&str>) -> Result<Fetched> {
         .with_config()
         .limit(1 << 30)
         .read_to_vec()
-        .context("reading the space")?;
+        .with_context(|| format!("reading {path}"))?;
     let size = wire.len();
-    let bytes = if zstd { zstd::decode_all(&wire[..]).context("unpacking the space")? } else { wire };
+    let bytes = if zstd { zstd::decode_all(&wire[..]).with_context(|| format!("unpacking {path}"))? } else { wire };
     Ok(Fetched::Body { bytes, tag, wire: size })
 }
 
