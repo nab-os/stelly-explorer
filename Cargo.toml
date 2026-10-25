@@ -1,0 +1,23 @@
+[package]
+name = "stelly-explorer"
+version = "0.1.0"
+edition = "2024"
+description = "Stelly's space, explored: the map and other projections of it, in 2D and 3D, coloured by what you choose"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow = "1"
+bytemuck = { version = "1.25.2", features = ["derive"] }
+eframe = { version = "0.36.2", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11"] }
+glam = { version = "0.34.1", features = ["bytemuck"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+stelly-core = { git = "https://github.com/nab-os/stelly", branch = "space-vectors" }
+ureq = "3.4.2"
+zstd = "0.14.2"
+
+[profile.release]
+debug = 1
+
+[dev-dependencies]
+pollster = "0.4"
