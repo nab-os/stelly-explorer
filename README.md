@@ -36,7 +36,7 @@ stelly-server pair --name explorer --scope play
 ```
 
 `STELLY_SERVER` and `STELLY_TOKEN` override both. The server must have
-`GET /api/space/vectors` (nab-os/stelly#192). The space is kept in
+`GET /api/space/vectors`, from Stelly 2.3.0. The space is kept in
 `~/.cache/stelly-explorer`, so a reopen asks the server only whether it changed,
 and a server that cannot be reached still leaves the last copy to look at.
 

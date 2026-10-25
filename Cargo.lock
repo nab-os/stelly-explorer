@@ -2324,8 +2324,8 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "stelly-core"
-version = "2.2.0"
-source = "git+https://github.com/nab-os/stelly?branch=space-vectors#9b854e1f2b58c82d40d3883dee99842c52f6d2d0"
+version = "2.3.0"
+source = "git+https://github.com/nab-os/stelly?tag=v2.3.0#a8de329e916428c283c5db630b1fd3ee7a17353c"
 dependencies = [
  "anyhow",
  "serde",
