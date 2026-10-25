@@ -2324,8 +2324,8 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "stelly-core"
-version = "2.3.0"
-source = "git+https://github.com/nab-os/stelly?branch=mix-phrases#f3aa2ba92804c998de040754af786c6807359659"
+version = "2.4.0"
+source = "git+https://github.com/nab-os/stelly?tag=v2.4.0#eb2e17259e240094e169e37d23113f09dd2c9d6f"
 dependencies = [
  "anyhow",
  "serde",
