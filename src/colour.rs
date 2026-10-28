@@ -21,6 +21,8 @@ pub enum Colouring {
     Column(usize),
     /// Whether stelly-mix has analysed it whole, and whether a set can use it.
     Mix,
+    /// The language its lyrics are in, from the space's `language` block.
+    Language,
 }
 
 pub enum Legend {
@@ -32,6 +34,9 @@ pub enum Legend {
     Wheel { major: [Rgba; 12], minor: [Rgba; 12], unsure: usize },
     /// Where tracks stand for mixing: (name, colour, tracks, which).
     Mix(Vec<(String, Rgba, usize, Readiness)>),
+    /// (language, colour, tracks), commonest first; then the rarer ones and
+    /// the tracks of none.
+    Languages(Vec<(String, Rgba, usize)>),
 }
 
 /// The validated categorical slots, stepped for a dark surface.
@@ -67,7 +72,62 @@ pub fn colour(v: &Vectors, mode: Colouring, readiness: &[Readiness]) -> (Vec<Rgb
         Colouring::Tempo => tempo(v),
         Colouring::Column(c) => column(v, c),
         Colouring::Mix => mix(v, readiness),
+        Colouring::Language => language(v),
     }
+}
+
+/// Darker than `MUTED`, for the tracks no language is known for, which are
+/// most of them: the rarer languages stay visible above them.
+pub const NO_LANGUAGE: Rgba = rgb(0x3a, 0x3e, 0x4a);
+
+/// Each track's language: its column in the `language` block, where the
+/// space has one. A track sung in a language the block has no column for,
+/// an instrumental or one without lyrics has none.
+pub fn languages(v: &Vectors) -> (Vec<String>, Vec<Option<usize>>) {
+    let Some(block) = v.head.blocks.iter().find(|b| b.name == "language") else {
+        return (Vec::new(), vec![None; v.head.n]);
+    };
+    let of = (0..v.head.n)
+        .map(|i| (block.start..block.end).find(|&c| unquantise(v.row(i)[c]) > 0.5).map(|c| c - block.start))
+        .collect();
+    (block.columns.clone(), of)
+}
+
+/// One track's language, by name, for its card.
+pub fn language_label(v: &Vectors, i: usize) -> Option<String> {
+    let block = v.head.blocks.iter().find(|b| b.name == "language")?;
+    let c = (block.start..block.end).find(|&c| unquantise(v.row(i)[c]) > 0.5)?;
+    Some(language_name(block.columns.get(c - block.start)?))
+}
+
+/// The language's name in English, or its code where whatlang has none.
+pub fn language_name(code: &str) -> String {
+    whatlang::Lang::from_code(code).map_or_else(|| code.to_string(), |l| l.eng_name().to_string())
+}
+
+fn language(v: &Vectors) -> (Vec<Rgba>, Legend) {
+    let (codes, of) = languages(v);
+    let mut counts = vec![0usize; codes.len()];
+    of.iter().flatten().for_each(|&l| counts[l] += 1);
+    let mut order: Vec<usize> = (0..codes.len()).filter(|&l| counts[l] > 0).collect();
+    order.sort_by(|a, b| counts[*b].cmp(&counts[*a]).then(a.cmp(b)));
+    let mut slot = vec![None; codes.len()];
+    for (s, l) in order.iter().take(CATEGORICAL.len()).enumerate() {
+        slot[*l] = Some(s);
+    }
+    let colours = of.iter().map(|l| l.map_or(NO_LANGUAGE, |l| slot[l].map_or(MUTED, |s| CATEGORICAL[s]))).collect();
+
+    let mut legend: Vec<(String, Rgba, usize)> =
+        order.iter().take(CATEGORICAL.len()).enumerate().map(|(s, &l)| (language_name(&codes[l]), CATEGORICAL[s], counts[l])).collect();
+    let rest: usize = order.iter().skip(CATEGORICAL.len()).map(|&l| counts[l]).sum();
+    if rest > 0 {
+        legend.push((format!("{} other languages", order.len() - CATEGORICAL.len()), MUTED, rest));
+    }
+    let none = of.iter().filter(|l| l.is_none()).count();
+    if none > 0 {
+        legend.push(("No language known".into(), NO_LANGUAGE, none));
+    }
+    (colours, Legend::Languages(legend))
 }
 
 /// Ready in the green slot, drifting in the amber one, the rest grey: a
@@ -258,6 +318,35 @@ mod tests {
                 assert_eq!(found.camelot(), (number, if minor { 'A' } else { 'B' }));
             }
         }
+    }
+
+    #[test]
+    fn tracks_are_coloured_by_the_language_they_are_sung_in() {
+        use stelly_core::vectors::{VectorBlock, VectorsHead, quantise};
+        let mut v = Vectors {
+            head: VectorsHead {
+                n: 4,
+                dims: 3,
+                blocks: vec![
+                    VectorBlock { name: "tempo".into(), start: 0, end: 1, columns: vec!["t".into()], default_weight: 1.0 },
+                    VectorBlock { name: "language".into(), start: 1, end: 3, columns: vec!["eng".into(), "fra".into()], default_weight: 0.6 },
+                ],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // Two in French, one in English, one of none.
+        for language in [[0.0, 1.0], [1.0, 0.0], [0.0, 1.0], [0.0, 0.0]] {
+            v.rows.extend([quantise(0.3), quantise(language[0]), quantise(language[1])]);
+        }
+
+        let (colours, legend) = colour(&v, Colouring::Language, &[]);
+        assert_eq!(colours, [CATEGORICAL[0], CATEGORICAL[1], CATEGORICAL[0], NO_LANGUAGE]);
+        let Legend::Languages(rows) = legend else { panic!("not a language legend") };
+        let rows: Vec<(&str, usize)> = rows.iter().map(|(name, _, n)| (name.as_str(), *n)).collect();
+        assert_eq!(rows, [("French", 2), ("English", 1), ("No language known", 1)]);
+        assert_eq!(language_label(&v, 1).as_deref(), Some("English"));
+        assert_eq!(language_label(&v, 3), None);
     }
 
     #[test]
