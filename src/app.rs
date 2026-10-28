@@ -777,6 +777,9 @@ impl Explorer {
             ui.selectable_value(&mut self.colouring, Colouring::Key, "Key");
             ui.selectable_value(&mut self.colouring, Colouring::Tempo, "Tempo");
             ui.selectable_value(&mut self.colouring, Colouring::Mix, "Mix").on_hover_text("Which tracks stelly-mix has analysed whole, and which a set can use");
+            if v.head.blocks.iter().any(|b| b.name == "language" && b.end > b.start) {
+                ui.selectable_value(&mut self.colouring, Colouring::Language, "Language").on_hover_text("The language each track's lyrics are in");
+            }
             let column = if let Colouring::Column(c) = self.colouring { Some(c) } else { None };
             if ui.selectable_label(column.is_some(), "Column").clicked() && column.is_none() {
                 let mood = v.head.blocks.iter().find(|b| b.name == "mood").map_or(0, |b| b.start);
@@ -925,6 +928,18 @@ impl Explorer {
                 }
                 ui.label(RichText::new("Click a genre to show only its tracks.").color(MUTED).small());
             }
+            Legend::Languages(rows) => {
+                for (name, rgba, count) in rows {
+                    ui.horizontal(|ui| {
+                        swatch(ui, *rgba);
+                        ui.label(RichText::new(name).color(TEXT));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(RichText::new(count.to_string()).color(MUTED).small());
+                        });
+                    });
+                }
+                ui.label(RichText::new("From each track's lyrics, as LRCLIB has them.").color(MUTED).small());
+            }
             Legend::Wheel { major, minor, unsure } => {
                 egui::Grid::new("wheel").num_columns(6).spacing([4.0, 4.0]).show(ui, |ui| {
                     for (letter, row_colours, is_minor) in [('B', major, false), ('A', minor, true)] {
@@ -1023,6 +1038,7 @@ impl Explorer {
                 ("Genre", genre),
                 ("Tempo", if v.bpm[i].is_finite() { format!("{:.0} BPM", v.bpm[i]) } else { "none found".into() }),
                 ("Key", colour::key_label(&v, i)),
+                ("Language", colour::language_label(&v, i).unwrap_or_else(|| "none known".into())),
                 ("Id", v.ids[i].to_string()),
             ] {
                 ui.label(RichText::new(k).color(MUTED));
